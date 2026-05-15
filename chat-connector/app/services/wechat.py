@@ -39,7 +39,8 @@ class WeChatClient:
         token: str,
     ) -> bool:
         parts = sorted([token, timestamp, nonce])
-        digest = hashlib.sha1("".join(parts).encode("utf-8")).hexdigest()
+        # WeChat MP server config requires SHA1 for this signature (not configurable).
+        digest = hashlib.sha1("".join(parts).encode("utf-8")).hexdigest()  # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
         return digest == signature
 
     def check_request_signature(
