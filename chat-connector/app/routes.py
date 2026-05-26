@@ -190,7 +190,7 @@ def feishu_callback():
         }), 400
 
     if body.get("type") == "url_verification":
-        if body.get("token") == Config.FEISHU_VERIFICATION_TOKEN:
+        if Config.FEISHU_VERIFICATION_TOKEN and body.get("token") == Config.FEISHU_VERIFICATION_TOKEN:
             return jsonify({"challenge": body.get("challenge")})
         logger.error("Feishu URL verification token mismatch")
         return jsonify({"error": "Forbidden"}), 403
