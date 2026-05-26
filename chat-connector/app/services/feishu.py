@@ -1,19 +1,17 @@
+"""Feishu (Lark) event subscription and Open API adapter."""
+
 import json
 import logging
 import threading
 import time
-from typing import Any, Optional, Protocol
+from collections.abc import Callable
+from typing import Any, Optional
 
 import httpx
 
 from app.config import Config
-from app.response_validator import ResponseValidator
 
 logger = logging.getLogger(__name__)
-
-
-class AIClient(Protocol):
-    def get_completion(self, user_message: str, user_id: Optional[str] = None) -> str: ...
 
 
 class FeishuClient:
@@ -26,41 +24,38 @@ class FeishuClient:
         self._app_id = app_id
         self._app_secret = app_secret
         self._token: Optional[str] = None
-        self._token_expire_at_ms: float = 0.0
+        self._token_expire_at: float = 0.0
         self._lock = threading.Lock()
 
     def validate_config(self) -> bool:
         return bool(self._app_id and self._app_secret)
 
     def get_tenant_access_token(self) -> str:
-        now = time.time() * 1000
         with self._lock:
-            if self._token and now < self._token_expire_at_ms - 60_000:
+            if self._token and time.monotonic() < self._token_expire_at - 60:
                 return self._token
 
-        if not self.validate_config():
-            raise RuntimeError("FEISHU_APP_ID or FEISHU_APP_SECRET missing")
+            if not self.validate_config():
+                raise RuntimeError("FEISHU_APP_ID or FEISHU_APP_SECRET missing")
 
-        payload = {"app_id": self._app_id, "app_secret": self._app_secret}
-        with httpx.Client(timeout=10.0) as client:
-            r = client.post(
-                self.TOKEN_URL,
-                headers={"Content-Type": "application/json; charset=utf-8"},
-                json=payload,
-            )
-            r.raise_for_status()
-            data = r.json()
+            payload = {"app_id": self._app_id, "app_secret": self._app_secret}
+            with httpx.Client(timeout=10.0) as client:
+                r = client.post(
+                    self.TOKEN_URL,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                    json=payload,
+                )
+                r.raise_for_status()
+                data = r.json()
 
-        if data.get("code") != 0:
-            raise RuntimeError(f"Feishu token API error: {data.get('msg')}")
+            if data.get("code") != 0:
+                raise RuntimeError(f"Feishu token API error: {data.get('msg')}")
 
-        token = data["tenant_access_token"]
-        expire_sec = int(data.get("expire", 7200))
-        with self._lock:
-            self._token = token
-            self._token_expire_at_ms = time.time() * 1000 + expire_sec * 1000
-        logger.info("Tenant access token refreshed")
-        return token
+            self._token = data["tenant_access_token"]
+            expire_sec = int(data.get("expire", 7200))
+            self._token_expire_at = time.monotonic() + expire_sec
+            logger.info("Tenant access token refreshed")
+            return self._token
 
     def send_text_to_chat(self, chat_id: str, text: str, timeout: float = 10.0) -> dict[str, Any]:
         token = self.get_tenant_access_token()
@@ -79,7 +74,15 @@ class FeishuClient:
                 },
                 json=body,
             )
-            r.raise_for_status()
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    "Feishu send_text_to_chat failed: status=%s body=%s",
+                    e.response.status_code,
+                    e.response.text,
+                )
+                raise
             return r.json()
 
 
@@ -109,9 +112,9 @@ def process_im_text_message(
     *,
     event: dict[str, Any],
     feishu: FeishuClient,
-    ai_client: AIClient,
+    get_ai_response: Callable[[str, str], str],
 ) -> None:
-    """Handle a Feishu im.message.receive_v1 text event (runs outside request context)."""
+    """Handle a Feishu im.message.receive_v1 text event."""
     message = event.get("message") or {}
     if message.get("message_type") != "text":
         logger.info("Ignoring non-text message (%s)", message.get("message_type"))
@@ -130,11 +133,10 @@ def process_im_text_message(
 
     if len(user_message) > Config.MAX_MESSAGE_LENGTH:
         try:
-            feishu.send_text_to_chat(
-                chat_id,
+            feishu.send_text_to_chat(chat_id, (
                 f"Your message is too long. Please keep it under "
-                f"{Config.MAX_MESSAGE_LENGTH} characters.",
-            )
+                f"{Config.MAX_MESSAGE_LENGTH} characters."
+            ))
         except httpx.HTTPError as e:
             logger.error("Failed to send length limit message: %s", e)
         return
@@ -145,12 +147,10 @@ def process_im_text_message(
         logger.error("Feishu configuration incomplete")
         return
 
-    # Flowise/OpenRouter session key: stable per chat (same pattern as LINE WORKS user_id).
-    session_key = chat_id
+    session_id = f"feishu:{chat_id}"
 
     try:
-        ai_raw = ai_client.get_completion(user_message, user_id=session_key)
-        ai_reply = ResponseValidator.validate(str(ai_raw or ""), user_message=user_message)
+        ai_reply = get_ai_response(user_message, session_id)
         send_result = feishu.send_text_to_chat(chat_id, ai_reply)
         if isinstance(send_result, dict) and send_result.get("code") != 0:
             logger.error("Feishu send returned error payload: %s", send_result)

@@ -1,7 +1,10 @@
+"""Application configuration loaded from environment variables."""
+
 import os
 
 
 class Config:
+    """Centralized environment-backed settings for the chat connector."""
     # LINE WORKS API
     LW_CLIENT_ID = os.environ.get("LW_API_20_CLIENT_ID")
     LW_CLIENT_SECRET = os.environ.get("LW_API_20_CLIENT_SECRET")
@@ -13,13 +16,23 @@ class Config:
     BASE_API_URL = "https://www.worksapis.com/v1.0"
     BASE_AUTH_URL = "https://auth.worksmobile.com/oauth2/v2.0"
 
+    # DingTalk HTTP robot callbacks
+    DINGTALK_ALLOWED_USERS = os.environ.get("DINGTALK_ALLOWED_USERS", "")
+    DINGTALK_ALLOW_ALL_USERS = os.environ.get("DINGTALK_ALLOW_ALL_USERS", "false").lower() == "true"
+    DINGTALK_REQUIRE_MENTION = os.environ.get("DINGTALK_REQUIRE_MENTION", "true").lower() == "true"
+    DINGTALK_GROUP_SESSIONS_PER_USER = (
+        os.environ.get("DINGTALK_GROUP_SESSIONS_PER_USER", "true").lower() == "true"
+    )
+
     # Feishu (Lark) Open Platform
     FEISHU_VERIFICATION_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN")
     FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID")
     FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET")
 
-    # Chat Provider: "flowise" (recommended) or "openrouter" (demo/experiment)
-    CHAT_PROVIDER = os.environ.get("CHAT_PROVIDER", "flowise").lower()
+    # AI Provider: "flowise" (recommended) or "openrouter" (demo/experiment).
+    # CHAT_PROVIDER is kept as a temporary fallback for existing deployments.
+    AI_PROVIDER = os.environ.get("AI_PROVIDER", os.environ.get("CHAT_PROVIDER", "flowise")).lower()
+    CHAT_PROVIDER = AI_PROVIDER
 
     # OpenRouter API (demo/experiment)
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")

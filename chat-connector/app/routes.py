@@ -1,10 +1,12 @@
-import logging
-import threading
+"""Flask routes for chat-platform webhooks and health checks."""
 
-from flask import Blueprint, copy_current_request_context, current_app, jsonify, request
+import logging
+
+from flask import Blueprint, current_app, jsonify, request
 
 from app.config import Config
 from app.response_validator import ResponseValidator
+from app.services.dingtalk import DingTalkClient
 from app.services.feishu import FeishuClient, process_im_text_message
 from app.services.flowise import FlowiseClient
 from app.services.lineworks import LineWorksClient
@@ -14,9 +16,10 @@ bp = Blueprint('main', __name__)
 logger = logging.getLogger(__name__)
 
 lw_client = LineWorksClient(Config)
+dingtalk_client = DingTalkClient(Config)
 feishu_client = FeishuClient(Config.FEISHU_APP_ID, Config.FEISHU_APP_SECRET)
 
-if Config.CHAT_PROVIDER == 'openrouter':
+if Config.AI_PROVIDER == 'openrouter':
     logger.info("Using OpenRouter as chat provider (demo/experiment)")
     ai_client = OpenRouterClient(
         Config.OPENROUTER_API_KEY,
@@ -37,11 +40,30 @@ else:
 @bp.route('/')
 def health():
     """Health check endpoint."""
-    return jsonify({"status": "ok", "provider": Config.CHAT_PROVIDER}), 200
+    return jsonify({
+        "status": "ok",
+        "ai_provider": Config.AI_PROVIDER,
+        "chat_clients": ["lineworks", "dingtalk", "feishu"],
+    }), 200
+
+
+def get_ai_response(user_text: str, session_id: str) -> str:
+    """Call the configured AI provider and validate the response."""
+    ai_response_text = ai_client.get_completion(user_text, user_id=session_id)
+    return ResponseValidator.validate(
+        str(ai_response_text) if ai_response_text else "",
+        user_message=user_text
+    )
+
+
+def message_too_long_response() -> str:
+    """Return the user-facing error message for over-length messages."""
+    return f"Your message is too long. Please keep it under {Config.MAX_MESSAGE_LENGTH} characters."
 
 
 @bp.route('/callback', methods=['POST'])
-def callback():
+@bp.route('/lineworks/callback', methods=['POST'])
+def lineworks_callback():
     """Handle LINE WORKS message callbacks."""
     try:
         raw_body = request.get_data()
@@ -84,7 +106,7 @@ def callback():
             lw_client.send_message(user_id, {
                 "content": {
                     "type": "text",
-                    "text": f"Your message is too long. Please keep it under {Config.MAX_MESSAGE_LENGTH} characters."
+                    "text": message_too_long_response()
                 }
             })
             return 'OK', 200
@@ -93,11 +115,7 @@ def callback():
             current_app.logger.error("Missing one or more LINE WORKS environment variables.")
             return 'Internal Server Error', 500
 
-        ai_response_text = ai_client.get_completion(user_text, user_id=user_id)
-        ai_response_text = ResponseValidator.validate(
-            str(ai_response_text) if ai_response_text else "",
-            user_message=user_text
-        )
+        ai_response_text = get_ai_response(user_text, session_id=f"lineworks:{user_id}")
 
         reply_content = {
             "content": {
@@ -116,11 +134,60 @@ def callback():
         return 'Internal Server Error', 500
 
 
-@bp.route('/webhook', methods=['POST'])
-def feishu_webhook():
+@bp.route('/dingtalk/callback', methods=['POST'])
+def dingtalk_callback():
+    """Handle DingTalk HTTP-mode robot callbacks."""
+    try:
+        data = request.get_json(silent=True)
+        if data is None:
+            current_app.logger.warning("Invalid or empty DingTalk JSON body")
+            return 'Bad Request', 400
+
+        message = dingtalk_client.parse_message(data)
+        if message is None:
+            return 'OK', 200
+
+        should_process, reason = dingtalk_client.should_process(message)
+        if not should_process:
+            current_app.logger.info(reason)
+            return 'OK', 200
+
+        if len(message.text) > Config.MAX_MESSAGE_LENGTH:
+            current_app.logger.warning(
+                f"DingTalk message from {message.sender_user_id} exceeds max length "
+                f"({len(message.text)} > {Config.MAX_MESSAGE_LENGTH})"
+            )
+            dingtalk_client.send_text(message.session_webhook, message_too_long_response())
+            return 'OK', 200
+
+        ai_response_text = get_ai_response(message.text, session_id=message.session_id)
+        dingtalk_client.send_text(message.session_webhook, ai_response_text)
+        current_app.logger.info(f"Sent DingTalk reply to user {message.sender_user_id}")
+
+        return 'OK', 200
+
+    except Exception as e:
+        current_app.logger.error(f"Error processing DingTalk callback: {e}")
+        return 'Internal Server Error', 500
+
+
+@bp.route('/feishu/callback', methods=['POST'])
+def feishu_callback():
     """Handle Feishu (Lark) event subscription callbacks."""
     body = request.get_json(silent=True) or {}
-    logger.info("Feishu webhook received")
+    logger.info("Feishu callback received")
+
+    if body.get("encrypt"):
+        logger.error(
+            "Feishu Encrypt Key is enabled but payload decryption is not implemented; "
+            "disable Encrypt Key in the Feishu developer console or add decryption support."
+        )
+        return jsonify({
+            "error": (
+                "Encrypted payloads are not supported. "
+                "Disable Encrypt Key in your Feishu app event subscription settings."
+            )
+        }), 400
 
     if body.get("type") == "url_verification":
         if body.get("token") == Config.FEISHU_VERIFICATION_TOKEN:
@@ -128,20 +195,20 @@ def feishu_webhook():
         logger.error("Feishu URL verification token mismatch")
         return jsonify({"error": "Forbidden"}), 403
 
-    if body.get("header", {}).get("event_type") == "im.message.receive_v1":
-        event = body.get("event") or {}
+    header = body.get("header") or {}
+    event_type = header.get("event_type")
 
-        @copy_current_request_context
-        def worker():
-            try:
-                process_im_text_message(
-                    event=event,
-                    feishu=feishu_client,
-                    ai_client=ai_client,
-                )
-            except Exception as e:
-                current_app.logger.error("Feishu background worker failed: %s", e)
+    if event_type == "im.message.receive_v1":
+        try:
+            process_im_text_message(
+                event=body.get("event") or {},
+                feishu=feishu_client,
+                get_ai_response=get_ai_response,
+            )
+        except Exception as e:
+            logger.exception("Error processing Feishu callback: %s", e)
+            return 'Internal Server Error', 500
+        return jsonify({"code": 0, "msg": "ok"}), 200
 
-        threading.Thread(target=worker, daemon=True).start()
-
+    logger.info("Ignoring Feishu event_type=%s", event_type)
     return jsonify({"code": 0, "msg": "ok"}), 200
