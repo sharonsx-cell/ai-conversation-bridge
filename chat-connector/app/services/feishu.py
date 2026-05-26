@@ -120,6 +120,10 @@ def process_im_text_message(
         logger.info("Ignoring non-text message (%s)", message.get("message_type"))
         return
 
+    if not feishu.validate_config():
+        logger.error("Feishu configuration incomplete")
+        return
+
     chat_id = message.get("chat_id")
     if not chat_id:
         logger.error("Missing chat_id on Feishu message")
@@ -142,10 +146,6 @@ def process_im_text_message(
         return
 
     logger.info('Feishu user %s in chat %s: "%s"', sender_id or "unknown", chat_id, user_message)
-
-    if not feishu.validate_config():
-        logger.error("Feishu configuration incomplete")
-        return
 
     session_id = f"feishu:{chat_id}"
 
