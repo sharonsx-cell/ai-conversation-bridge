@@ -21,6 +21,7 @@ class FeishuClient:
     MESSAGES_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
 
     def __init__(self, app_id: Optional[str], app_secret: Optional[str]):
+        """Store Feishu app credentials and initialize token cache state."""
         self._app_id = app_id
         self._app_secret = app_secret
         self._token: Optional[str] = None
@@ -28,9 +29,11 @@ class FeishuClient:
         self._lock = threading.Lock()
 
     def validate_config(self) -> bool:
+        """Return True when Feishu app credentials are configured."""
         return bool(self._app_id and self._app_secret)
 
     def get_tenant_access_token(self) -> str:
+        """Return a cached tenant access token, refreshing when near expiry."""
         with self._lock:
             if self._token and time.monotonic() < self._token_expire_at - 60:
                 return self._token
@@ -58,6 +61,7 @@ class FeishuClient:
             return self._token
 
     def send_text_to_chat(self, chat_id: str, text: str, timeout: float = 10.0) -> dict[str, Any]:
+        """Send a text message to a Feishu chat via the IM v1 API."""
         token = self.get_tenant_access_token()
         url = f"{self.MESSAGES_URL}?receive_id_type=chat_id"
         body = {
@@ -97,6 +101,7 @@ def _sender_id_from_event(event: dict[str, Any]) -> Optional[str]:
 
 
 def _parse_text_content(raw_content: Any) -> str:
+    """Extract and trim user text from a Feishu message content field."""
     if not raw_content:
         return ""
     if isinstance(raw_content, dict):
@@ -136,31 +141,39 @@ def process_im_text_message(
         return
 
     if len(user_message) > Config.MAX_MESSAGE_LENGTH:
+        if not feishu.validate_config():
+            logger.error("Feishu configuration incomplete")
+            return
         try:
             feishu.send_text_to_chat(chat_id, (
                 f"Your message is too long. Please keep it under "
                 f"{Config.MAX_MESSAGE_LENGTH} characters."
             ))
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error("Failed to send length limit message: %s", e)
         return
 
-    logger.info('Feishu user %s in chat %s: "%s"', sender_id or "unknown", chat_id, user_message)
+    logger.info(
+        "Feishu user %s in chat %s (message_len=%d)",
+        sender_id or "unknown",
+        chat_id,
+        len(user_message),
+    )
 
-    session_id = f"feishu:{chat_id}"
+    session_id = f"feishu:{chat_id}:{sender_id or 'unknown'}"
 
     try:
         ai_reply = get_ai_response(user_message, session_id)
         send_result = feishu.send_text_to_chat(chat_id, ai_reply)
         if isinstance(send_result, dict) and send_result.get("code") != 0:
             logger.error("Feishu send returned error payload: %s", send_result)
-    except httpx.HTTPError as e:
-        logger.error("Feishu HTTP error while processing message: %s", e)
+    except Exception as e:
+        logger.error("Feishu error while processing message: %s", e)
         try:
             feishu.send_text_to_chat(
                 chat_id,
                 "Sorry, an error occurred while processing your request. "
                 "Please try again later or contact support.",
             )
-        except httpx.HTTPError as send_err:
+        except Exception as send_err:
             logger.error("Failed to send error message: %s", send_err)

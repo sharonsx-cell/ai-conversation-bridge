@@ -196,10 +196,10 @@ def feishu_callback():
         return jsonify({"error": "Forbidden"}), 403
 
     header = body.get("header") or {}
-    if (
-        Config.FEISHU_VERIFICATION_TOKEN
-        and header.get("token") != Config.FEISHU_VERIFICATION_TOKEN
-    ):
+    if not Config.FEISHU_VERIFICATION_TOKEN:
+        logger.error("FEISHU_VERIFICATION_TOKEN is not configured; rejecting Feishu event")
+        return jsonify({"error": "Forbidden"}), 403
+    if header.get("token") != Config.FEISHU_VERIFICATION_TOKEN:
         logger.error("Feishu event verification token mismatch")
         return jsonify({"error": "Forbidden"}), 403
 
